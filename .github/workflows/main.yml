@@ -1,0 +1,101 @@
+name: ARGI Master Key Sync - Advanced
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  sync-master-key:
+    runs-on: ubuntu-latest
+    env:
+      # Data Identitas & Kunci Utama [cite: 2025-12-23]
+      ARGI_MASTER_KEY: ${{ secrets.ARGI_MASTER_KEY }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_PROJECT_SLUG: ${{ secrets.VERCEL_PROJECT_SLUG }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      CLOUDFLARE_KV_NAMESPACE: ${{ secrets.CLOUDFLARE_KV_NAMESPACE }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Audit Log
+        run: |
+          mkdir -p .argi_logs
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "{}" > .argi_logs/latest_audit.json
+          echo $timestamp > .argi_logs/timestamp.txt
+
+      - name: Sync Master Key to Vercel (idempotent)
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+import os,json
+print(json.dumps({
+  "key":"GEMINI_API_KEY",
+  "value": os.environ["ARGI_MASTER_KEY"],
+  "type":"plain",
+  "target":["production","preview"]
+}))
+PY
+)
+          existing_id=$(curl -sS -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            "https://api.vercel.com/v1/projects/${VERCEL_PROJECT_SLUG}/env" | python3 - <<'PY'
+import sys,json
+data=json.load(sys.stdin)
+for e in data.get("envs", []):
+    if e.get("key")=="GEMINI_API_KEY":
+        print(e.get("id"))
+        break
+else:
+    print("")
+PY
+)
+          if [ -n "$existing_id" ]; then
+            curl -sS -X PATCH "https://api.vercel.com/v1/projects/${VERCEL_PROJECT_SLUG}/env/${existing_id}" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$payload"
+            echo '{"client":"Vercel","action":"update"}' > .argi_logs/latest_audit.json
+          else
+            curl -sS -X POST "https://api.vercel.com/v1/projects/${VERCEL_PROJECT_SLUG}/env" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$payload"
+            echo '{"client":"Vercel","action":"create"}' > .argi_logs/latest_audit.json
+          fi
+
+      - name: Validate & Sync Supabase
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" "${SUPABASE_URL}")
+          echo "{\"client\":\"Supabase\",\"http_status\":$status}" >> .argi_logs/latest_audit.json
+
+      - name: Sync Master Key to Cloudflare KV
+        run: |
+          result=$(curl -sS -o /dev/null -w "%{http_code}" -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ZONE_ID}/storage/kv/namespaces/${CLOUDFLARE_KV_NAMESPACE}/values/GEMINI_API_KEY" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: text/plain" \
+            --data "${ARGI_MASTER_KEY}")
+          echo "{\"client\":\"Cloudflare\",\"http_status\":$result}" >> .argi_logs/latest_audit.json
+
+      - name: Sync Master Key to GitHub Secrets (Self-update)
+        uses: peter-evans/create-or-update-secret@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          secret-name: ARGI_MASTER_KEY
+          secret-value: ${{ secrets.ARGI_MASTER_KEY }}
+
+      - name: Commit Audit Log
+        run: |
+          git config --local user.name "ARGI Sync Bot"
+          git config --local user.email "argi-bot@neurosphere.ai"
+          git add .argi_logs/latest_audit.json
+          git commit -m "Update ARGI master key audit log [skip ci]" || echo "No changes"
+          git push origin main || echo "Push failed, possibly no permission"
